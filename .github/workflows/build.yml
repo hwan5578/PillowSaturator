@@ -1,0 +1,39 @@
+# Builds the Windows VST3 (and Standalone) with MSVC on GitHub's Windows runners.
+# Push this project to a GitHub repository (or upload it in the web UI); the result appears
+# under Actions -> latest "Build" run -> Artifacts.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (downloads JUCE)
+        run: cmake -S . -B build -A x64 -DPILLOW_FORMATS="VST3;Standalone"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel --target PillowSaturator_VST3 PillowSaturator_Standalone PillowEngineTests
+
+      - name: Engine tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: PillowSaturator-Windows-VST3
+          path: build/PillowSaturator_artefacts/Release/VST3/
+          if-no-files-found: error
+
+      - name: Upload Standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: PillowSaturator-Windows-Standalone
+          path: build/PillowSaturator_artefacts/Release/Standalone/
+          if-no-files-found: error
