@@ -1,12 +1,16 @@
 # Builds the Windows VST3 (and Standalone) with MSVC on GitHub's Windows runners.
-# Push this project to a GitHub repository (or upload it in the web UI); the result appears
-# under Actions -> latest "Build" run -> Artifacts.
+# Results: Actions -> latest "Build" run -> Artifacts, and (for pushes to main) the zips are
+# also committed to the `builds` branch so they can be fetched with plain git.
 name: Build
 
 on:
   push:
+    branches: [ main ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -37,3 +41,19 @@ jobs:
           name: PillowSaturator-Windows-Standalone
           path: build/PillowSaturator_artefacts/Release/Standalone/
           if-no-files-found: error
+
+      - name: Publish zips to the 'builds' branch
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "publish"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Compress-Archive -Path "build/PillowSaturator_artefacts/Release/VST3/*" -DestinationPath "$out/PillowSaturator-Windows-VST3.zip" -Force
+          Compress-Archive -Path "build/PillowSaturator_artefacts/Release/Standalone/*" -DestinationPath "$out/PillowSaturator-Windows-Standalone.zip" -Force
+          Set-Location $out
+          git init -q -b builds
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Windows build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" builds
