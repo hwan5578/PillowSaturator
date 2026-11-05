@@ -32,7 +32,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PillowSaturator-Windows-VST3
-          path: build/PillowSaturator_artefacts/Release/VST3/
+          path: build/PillowSaturator_artefacts/Release/VST3/*.vst3
           if-no-files-found: error
 
       - name: Upload Standalone
@@ -48,7 +48,7 @@ jobs:
         run: |
           $out = Join-Path $env:RUNNER_TEMP "publish"
           New-Item -ItemType Directory -Force $out | Out-Null
-          Compress-Archive -Path "build/PillowSaturator_artefacts/Release/VST3/*" -DestinationPath "$out/PillowSaturator-Windows-VST3.zip" -Force
+          Compress-Archive -Path "build/PillowSaturator_artefacts/Release/VST3/*.vst3" -DestinationPath "$out/PillowSaturator-Windows-VST3.zip" -Force
           Compress-Archive -Path "build/PillowSaturator_artefacts/Release/Standalone/*" -DestinationPath "$out/PillowSaturator-Windows-Standalone.zip" -Force
           Set-Location $out
           git init -q -b builds
