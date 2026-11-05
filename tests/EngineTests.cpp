@@ -416,6 +416,117 @@ void testAutoGain()
         std::printf ("  dB (drive 0..36, worst of character 0/0.5/1)\n");
     }
     check (worst < 1.0, "auto gain within 1 dB at the reference level");
+
+    // parallel saturation must stay level-matched too (it is folded into the drive lookup)
+    std::printf ("  parallel (Tube/Glow/Clean, drive 6/18, input 0/+12, amount 50/100 %%):\n");
+    const char* focusName[] = { "Low", "Flat", "High" };
+    double worstPar = 0.0;
+    for (int focus = 0; focus < kNumParallelFocus; ++focus)
+        for (int alt = 0; alt < 2; ++alt)
+        {
+            double worstHere = 0.0;
+            for (int s : { (int) StyleId::Tube, (int) StyleId::Glow, (int) StyleId::Clean })
+                for (float drive : { 6.0f, 18.0f })
+                    for (float input : { 0.0f, 12.0f })
+                        for (float amount : { 0.5f, 1.0f })
+                        {
+                            EngineParams p = cleanParams();
+                            p.style = s;
+                            p.driveDb = drive;
+                            p.inputDb = input;
+                            p.character = 0.35f;
+                            p.parallel = amount;
+                            p.parallelFocus = focus;
+                            p.parallelAlt = alt == 1;
+                            const auto y = runTone (p, fs, bin, N, amp);
+                            const double change = db (rms (y) / (amp / std::sqrt (2.0)));
+                            if (std::abs (change) > std::abs (worstHere))
+                                worstHere = change;
+                        }
+            std::printf ("    %-4s %s worst %+5.2f dB\n", focusName[focus], alt ? "Alt" : "   ", worstHere);
+            worstPar = std::max (worstPar, std::abs (worstHere));
+        }
+    check (worstPar < 1.0, "auto gain within 1 dB with parallel saturation");
+}
+
+void testParallelAndAir()
+{
+    std::printf ("\n== Parallel saturation focus: H3 / H2 (dB re fundamental), Clean, drive 0, -18 dBFS ==\n");
+    const double fs = 48000.0;
+    const int N = 65536;
+    struct F { double hz; int bin; };
+    const F freqs[] = { { 60.0, 83 }, { 1000.0, 1365 }, { 5000.0, 6827 } };
+    const double amp = std::sqrt (2.0) * std::pow (10.0, -18.0 / 20.0);
+    const char* focusName[] = { "off ", "Low ", "Flat", "High" };
+    double thd[4][3] {};
+    for (int f = -1; f < kNumParallelFocus; ++f)
+    {
+        std::printf ("  %s", focusName[f + 1]);
+        for (int k = 0; k < 3; ++k)
+        {
+            EngineParams p = cleanParams();
+            p.style = (int) StyleId::Clean;
+            p.parallel = f < 0 ? 0.0f : 1.0f;
+            p.parallelFocus = std::max (0, f);
+            const auto y = runTone (p, fs, freqs[k].bin, N, amp);
+            const auto h = analyseHarmonics (y, freqs[k].bin);
+            thd[f + 1][k] = h.thd;
+            std::printf ("   %5.0f Hz H2 %6.1f H3 %6.1f THD %5.2f%%", freqs[k].hz, h.h[1], h.h[2], h.thd);
+        }
+        std::printf ("\n");
+    }
+    check (thd[1][0] > 3.0 * thd[1][2], "Low focus: lows get the harmonics");
+    check (thd[3][2] > 3.0 * thd[3][0], "High focus: highs get the harmonics");
+    check (thd[2][1] > 2.0 * thd[0][1], "Flat focus adds harmonics");
+
+    std::printf ("\n== Air: level change (dB) vs Air off, linear region ==\n  ");
+    double gain[6] {};
+    const double hz[6] = { 1000.0, 5000.0, 8000.0, 12000.0, 16000.0, 19000.0 };
+    for (int k = 0; k < 6; ++k)
+    {
+        const int Nk = 16384;
+        const int bin = (int) std::lround (hz[k] * Nk / fs) | 1;
+        EngineParams p = cleanParams();
+        p.inputDb = -24.0f;
+        p.air = false;
+        const auto off = runTone (p, fs, bin, Nk, 0.05);
+        p.air = true;
+        const auto on = runTone (p, fs, bin, Nk, 0.05);
+        gain[k] = db (rms (on) / rms (off));
+        std::printf ("%5.0f Hz %+5.2f   ", hz[k], gain[k]);
+    }
+    std::printf ("\n");
+    check (std::abs (gain[0]) < 0.1, "Air leaves 1 kHz alone");
+    check (gain[4] > 1.5 && gain[5] > gain[3], "Air lifts the top end, rising towards 20 kHz");
+
+    // Small-signal response with the parallel path at 100 %: Focus must not act as a big
+    // shelf, and the parallel path must not dull the top octave (any quality).
+    std::printf ("\n== Parallel 100 %%: small-signal response vs parallel off (dB), Clean, -50 dBFS ==\n");
+    const double rhz[7] = { 60.0, 200.0, 1000.0, 5000.0, 10000.0, 15000.0, 19500.0 };
+    for (int f = 0; f < kNumParallelFocus; ++f)
+        for (int q = 0; q < kNumQualities; q += 2)
+        {
+            std::printf ("  %s %dx", focusName[f + 1], 2 << q);
+            double lo = 1.0e9, hi = -1.0e9;
+            for (double h : rhz)
+            {
+                const int Nk = 16384;
+                const int bin = (int) std::lround (h * Nk / fs) | 1;
+                EngineParams p = cleanParams();
+                p.quality = q;
+                p.inputDb = -32.0f; // the tone below is -18 dBFS: -50 dBFS into the plug-in
+                const auto off = runTone (p, fs, bin, Nk, 0.177);
+                p.parallel = 1.0f;
+                p.parallelFocus = f;
+                const auto on = runTone (p, fs, bin, Nk, 0.177);
+                const double g = analyseHarmonics (on, bin).fundamentalDb - analyseHarmonics (off, bin).fundamentalDb;
+                lo = std::min (lo, g);
+                hi = std::max (hi, g);
+                std::printf ("  %5.0f %+5.2f", h, g);
+            }
+            std::printf ("   spread %.2f dB\n", hi - lo);
+            check (hi - lo < (f == (int) ParallelFocus::Flat ? 0.1 : 2.6), "parallel focus is a gentle emphasis, not a shelf");
+        }
 }
 
 void testAliasing()
@@ -441,6 +552,22 @@ void testAliasing()
             }
         std::printf (" dB\n");
     }
+    std::printf ("  %-12s", "Glow+Par Alt");
+    for (int linear = 0; linear < 2; ++linear)
+        for (int q = 0; q < kNumQualities; ++q)
+        {
+            EngineParams p = cleanParams();
+            p.style = (int) StyleId::Glow;
+            p.driveDb = 18.0f;
+            p.character = 0.35f;
+            p.parallel = 1.0f;
+            p.parallelAlt = true;
+            p.quality = q;
+            p.linearPhase = linear == 1;
+            const auto y = runTone (p, fs, bin, N, 0.5);
+            std::printf ("  %s%dx %6.1f", linear ? "LP" : "MP", 2 << q, worstAliasDb (y, bin, fs));
+        }
+    std::printf (" dB\n");
 }
 
 void testStability()
@@ -476,6 +603,10 @@ void testStability()
                 p.linearPhase = u01 (rng) > 0.5f;
                 p.stereoMode = u01 (rng) > 0.5f ? 1 : 0;
                 p.bypass = u01 (rng) > 0.9f;
+                p.parallel = u01 (rng) > 0.4f ? u01 (rng) : 0.0f;
+                p.parallelFocus = (int) (u01 (rng) * 2.999f);
+                p.parallelAlt = u01 (rng) > 0.5f;
+                p.air = u01 (rng) > 0.5f;
                 eng.setParameters (p);
 
                 const int len = 1 + (int) (u01 (rng) * 4095.0f);
@@ -532,6 +663,7 @@ void testSwitchClicks()
     p.style = 0;
     p.driveDb = 12.0f;
     p.character = 0.5f;
+    p.parallel = 0.7f; // so that focus / alt switches are audible in the test
     eng.setParameters (p, true);
     eng.reset();
 
@@ -549,12 +681,15 @@ void testSwitchClicks()
         if (k % 40 == 39)
         {
             ++changes;
-            switch (changes % 5)
+            switch (changes % 8)
             {
                 case 0: p.style = (p.style + 1) % kNumStyles; break;
                 case 1: p.quality = (p.quality + 1) % kNumQualities; break;
                 case 2: p.linearPhase = ! p.linearPhase; break;
                 case 3: p.bypass = ! p.bypass; break;
+                case 4: p.parallelFocus = (p.parallelFocus + 1) % kNumParallelFocus; break;
+                case 5: p.parallelAlt = ! p.parallelAlt; break;
+                case 6: p.air = ! p.air; break;
                 default: p.stereoMode = 1 - p.stereoMode; break;
             }
             eng.setParameters (p);
@@ -613,6 +748,32 @@ void testCpu()
             }
         std::printf ("  (of one core)\n");
     }
+    std::printf ("  %-12s", "Glow+Par");
+    for (int linear = 0; linear < 2; ++linear)
+        for (int q = 0; q < kNumQualities; ++q)
+        {
+            SaturatorEngine eng;
+            eng.prepare (fs, 2);
+            EngineParams p = cleanParams();
+            p.style = (int) StyleId::Glow;
+            p.driveDb = 12.0f;
+            p.character = 0.35f;
+            p.parallel = 1.0f;
+            p.air = true;
+            p.quality = q;
+            p.linearPhase = linear == 1;
+            eng.setParameters (p, true);
+            std::vector<float> a = l, b = r;
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int pos = 0; pos < total; pos += 512)
+            {
+                float* ptrs[2] = { a.data() + pos, b.data() + pos };
+                eng.process (ptrs, 2, std::min (512, total - pos));
+            }
+            const double sec = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
+            std::printf ("  %s%dx %5.2f%%", linear ? "LP" : "MP", 2 << q, 100.0 * sec / 10.0);
+        }
+    std::printf ("  (of one core)\n");
 }
 } // namespace
 
@@ -620,6 +781,11 @@ int main (int argc, char** argv)
 {
     enableFlushToZero();
     const bool quick = argc > 1 && std::string (argv[1]) == "--quick";
+    if (argc > 1 && std::string (argv[1]) == "--cpu")
+    {
+        testCpu();
+        return 0;
+    }
 
     const auto t0 = std::chrono::steady_clock::now();
     (void) AutoGainTable::get();
@@ -632,6 +798,7 @@ int main (int argc, char** argv)
     testHarmonics();
     testFrequencyDependence();
     testAutoGain();
+    testParallelAndAir();
     testAliasing();
     testStability();
     testSwitchClicks();

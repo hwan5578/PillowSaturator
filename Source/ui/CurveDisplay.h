@@ -3,25 +3,36 @@
 #include <array>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PillowLookAndFeel.h"
+#include "../Parameters.h"
 #include "../dsp/SaturatorEngine.h"
 
 namespace pillow::ui
 {
-// Static transfer curve of the current style / drive / character, normalised to the panel.
-// Asymmetry (Character) is visible as a curve that bends differently above and below zero.
+// Static transfer curve of the current settings, normalised to the panel.
+// Asymmetry (Character, parallel bias) is visible as a curve that bends differently above and
+// below zero. The parallel path is drawn for focus Low / Flat (High has no static curve).
 class CurveDisplay final : public juce::Component
 {
 public:
-    void setState (int newStyle, float newTotalDriveDb, float newCharacter, int newFactor)
+    struct State
     {
-        if (newStyle == style && std::abs (newTotalDriveDb - totalDriveDb) < 0.01f
-            && std::abs (newCharacter - character) < 0.001f && newFactor == factor)
-            return;
+        int style = 0, factor = 4, focus = 1;
+        float inputDb = 0.0f, driveDb = 6.0f, character = 0.35f, parallel = 0.0f;
+        bool alt = false, air = false;
 
-        style = newStyle;
-        totalDriveDb = newTotalDriveDb;
-        character = newCharacter;
-        factor = newFactor;
+        bool approxEquals (const State& o) const noexcept
+        {
+            return style == o.style && factor == o.factor && focus == o.focus && alt == o.alt && air == o.air
+                && std::abs (inputDb - o.inputDb) < 0.01f && std::abs (driveDb - o.driveDb) < 0.01f
+                && std::abs (character - o.character) < 0.001f && std::abs (parallel - o.parallel) < 0.001f;
+        }
+    };
+
+    void setState (const State& newState)
+    {
+        if (newState.approxEquals (state))
+            return;
+        state = newState;
         repaint();
     }
 
@@ -47,12 +58,15 @@ public:
         g.setColour (colours::track);
         g.drawLine (plot.getX(), plot.getBottom(), plot.getRight(), plot.getY(), 1.0f);
 
+        // Input gain is applied before the parallel path, Drive after it.
+        const float inGain = juce::Decibels::decibelsToGain (state.inputDb);
         std::array<float, numPoints + 1> ys {};
         float maxAbs = 1.0e-6f;
         for (int i = 0; i <= numPoints; ++i)
         {
             const float x = -1.0f + 2.0f * (float) i / (float) numPoints;
-            ys[(size_t) i] = pillow::dsp::SaturatorEngine::evaluateStaticCurve (style, x, totalDriveDb, character);
+            ys[(size_t) i] = pillow::dsp::SaturatorEngine::evaluateStaticCurve (
+                state.style, x * inGain, state.driveDb, state.character, state.parallel, state.focus, state.alt);
             maxAbs = juce::jmax (maxAbs, std::abs (ys[(size_t) i]));
         }
 
@@ -76,13 +90,26 @@ public:
         g.setColour (colours::textDim);
         const auto labels = r.reduced (16.0f, 9.0f);
         g.drawText ("TRANSFER", labels, juce::Justification::topLeft, false);
-        g.drawText (juce::String (factor) + "x OVERSAMPLING", labels, juce::Justification::topRight, false);
-        g.drawText (character < 0.01f ? "ODD" : "EVEN + ODD", labels, juce::Justification::bottomRight, false);
+        g.drawText (juce::String (state.factor) + "x OVERSAMPLING", labels, juce::Justification::topRight, false);
+
+        const bool parallelOn = state.parallel > 0.005f;
+        const bool even = state.character >= 0.01f || parallelOn; // the parallel curve is biased
+        g.drawText (even ? "EVEN + ODD" : "ODD", labels, juce::Justification::bottomRight, false);
+
+        juce::StringArray info;
+        if (pillow::dsp::getStyleSpec ((pillow::dsp::StyleId) state.style).twoStage)
+            info.add ("2 STAGES");
+        if (parallelOn)
+            info.add ("PARALLEL " + pillow::params::parallelFocusNames()[state.focus].toUpperCase()
+                      + (state.alt ? " ALT" : ""));
+        if (state.air)
+            info.add ("AIR");
+        g.setColour (colours::accent.withAlpha (0.85f));
+        g.drawText (info.joinIntoString (" + "), labels, juce::Justification::bottomLeft, false);
     }
 
 private:
     static constexpr int numPoints = 160;
-    int style = 0, factor = 4;
-    float totalDriveDb = 6.0f, character = 0.35f;
+    State state;
 };
 } // namespace pillow::ui

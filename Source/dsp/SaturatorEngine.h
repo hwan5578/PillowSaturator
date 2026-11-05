@@ -3,9 +3,10 @@
 // Pillow Saturator engine: the complete audio path, independent of any plug-in framework.
 //
 //   in -> Input gain -> [M/S encode] -> Low Cut -> style pre-EQ -> Drive -> envelope/bias
-//      -> upsample -> curve (ADAA) -> downsample (+ exact latency padding) -> DC block
-//      -> style post-EQ -> Tone (tilt) -> High Cut -> Auto Gain -> quality padding
-//      -> [M/S decode] -> Mix with latency-aligned dry -> Output gain -> bypass / switch fades
+//      -> upsample -> [+ parallel saturation (band focus)] -> curve (ADAA) [-> stage 2]
+//      -> downsample (+ exact latency padding) -> DC block -> style post-EQ -> Air
+//      -> Tone (tilt) -> High Cut -> Auto Gain -> quality padding -> [M/S decode]
+//      -> Mix with latency-aligned dry -> Output gain -> bypass / switch fades -> out
 //
 // Threading: prepare()/reset() from a non-audio thread while audio is stopped;
 // setParameters()/process() from the audio thread. No allocation or locking in process().
@@ -45,12 +46,47 @@ struct EngineParams
     bool linearPhase = false;
     int stereoMode = 0;         // StereoMode
     bool bypass = false;
+    float parallel = 0.0f;      //   0 .. 1   parallel saturation amount
+    int parallelFocus = 1;      // ParallelFocus (Low / Flat / High)
+    bool parallelAlt = false;   // hotter, more asymmetric parallel voicing
+    bool air = false;           // high-frequency lift
 };
+
+//==============================================================================
+// Helpers shared by the audio path, the tables and the UI curve display.
+namespace chain
+{
+    // Small-signal-normalised biased curve: slope 1 at the operating point.
+    inline double biasedCurve (CurveId c, double w, double bias, double norm) noexcept
+    {
+        return norm * (curveF (c, w + bias) - curveF (c, bias));
+    }
+
+    struct ParallelCurve
+    {
+        double gain = 1.0, bias = 0.0, norm = 1.0, offset = 0.0;
+
+        explicit ParallelCurve (bool alt) noexcept
+        {
+            const auto& v = getParallelVoicing (alt);
+            gain = std::pow (10.0, v.driveDb / 20.0);
+            bias = v.bias;
+            norm = 1.0 / (gain * TanhCurve::slope (bias));
+            offset = TanhCurve::f (bias);
+        }
+
+        // ~unity for small signals, compresses and adds harmonics when hot
+        double operator() (double x) const noexcept { return norm * (TanhCurve::f (x * gain + bias) - offset); }
+
+        // what the parallel path adds to the main path at amount 1 for band signal b
+        double contribution (double b) const noexcept { return (double) kParallelLinear * b + (*this) (b) - b; }
+    };
+} // namespace chain
 
 //==============================================================================
 // Static loudness compensation, measured once per process: for every style / drive /
 // character, the RMS ratio of a -18 dBFS (0 VU) 1 kHz sine before and after the style
-// (pre-EQ, curve incl. steady-state sag, post-EQ). With Auto Gain on the output level
+// (pre-EQ, curve(s) incl. steady-state sag, post-EQ). With Auto Gain on the output level
 // therefore matches the input level at the reference, whatever the drive.
 class AutoGainTable
 {
@@ -103,9 +139,12 @@ public:
 
         const double amp = std::sqrt (2.0) * std::pow (10.0, referenceDbfs / 20.0);
         const double g = std::pow (10.0, driveDb / 20.0) * spec.sensitivity;
-        const double bStatic = spec.biasScale * character;
-        const double norm = 1.0 / curveSlope (spec.curve, bStatic);
+        const double b1 = spec.biasScale * character;
+        const double norm1 = 1.0 / curveSlope (spec.curve, b1);
         const double sag = spec.sagAmount * character;
+        const double g2 = std::pow (10.0, spec.stage2MaxDriveDb * character / 20.0);
+        const double b2s = spec.stage2BiasScale * character;
+        const double norm2 = 1.0 / curveSlope (spec.curve2, b2s);
 
         double sumY = 0.0, sumY2 = 0.0, sumX2 = 0.0;
         for (int n = 0; n < warmup + measure; ++n)
@@ -116,20 +155,31 @@ public:
             v = pre[1].process (v);
             const double u = (double) v * g;
             const float e = env.process ((float) u);
-            const double b = clampValue (bStatic + sag * (double) e, -1.2, 1.2);
-            float y = (float) (norm * (curveF (spec.curve, u + b) - curveF (spec.curve, b)) / spec.sensitivity);
-            y = post[0].process (y);
-            y = post[1].process (y);
-            y = post[2].process (y);
+            double y;
+            if (spec.twoStage)
+            {
+                const double y1 = chain::biasedCurve (spec.curve, u, b1, norm1);
+                const double b2 = clampValue (b2s + sag * (double) e, -1.2, 1.2);
+                y = chain::biasedCurve (spec.curve2, y1 * g2, b2, norm2) / g2;
+            }
+            else
+            {
+                const double b = clampValue (b1 + sag * (double) e, -1.2, 1.2);
+                y = chain::biasedCurve (spec.curve, u, b, norm1);
+            }
+            float yf = (float) (y / spec.sensitivity);
+            yf = post[0].process (yf);
+            yf = post[1].process (yf);
+            yf = post[2].process (yf);
             if (spec.hfLossAmount > 0.0f)
             {
                 hfLoss.setCutoff (std::max (kTapeHfMinHz, kTapeHfMaxHz / (1.0 + spec.hfLossAmount * e)), fs);
-                y = hfLoss.lowpass (y);
+                yf = hfLoss.lowpass (yf);
             }
             if (n >= warmup)
             {
-                sumY += y;
-                sumY2 += (double) y * y;
+                sumY += yf;
+                sumY2 += (double) yf * yf;
                 sumX2 += x * x;
             }
         }
@@ -153,14 +203,95 @@ private:
 };
 
 //==============================================================================
+// How much hotter the main curve is driven by the parallel path at the reference level
+// (dB, -18 dBFS 1 kHz), per focus / voicing / amount / input gain. Added to the drive used
+// for the Auto Gain lookup, so the parallel path stays level-matched like Drive.
+class ParallelGainTable
+{
+public:
+    static constexpr int numAmount = 5;  // 0, .25, .5, .75, 1
+    static constexpr int numInput = 9;   // -24 .. +24 dB in 6 dB steps
+    static constexpr float minInputDb = -24.0f, inputStepDb = 6.0f;
+
+    static const ParallelGainTable& get()
+    {
+        static const ParallelGainTable table;
+        return table;
+    }
+
+    float lookupDb (int focus, bool alt, float amount, float inputDb) const noexcept
+    {
+        const auto& t = table[(size_t) clampValue (focus, 0, kNumParallelFocus - 1)][alt ? 1u : 0u];
+        const float aPos = clampValue (amount, 0.0f, 1.0f) * (float) (numAmount - 1);
+        const int a0 = std::min ((int) aPos, numAmount - 2);
+        const float af = aPos - (float) a0;
+        const float iPos = clampValue ((inputDb - minInputDb) / inputStepDb, 0.0f, (float) (numInput - 1));
+        const int i0 = std::min ((int) iPos, numInput - 2);
+        const float inf = iPos - (float) i0;
+
+        const float lo = t[(size_t) a0][(size_t) i0] + (t[(size_t) a0][(size_t) i0 + 1] - t[(size_t) a0][(size_t) i0]) * inf;
+        const float hi = t[(size_t) a0 + 1][(size_t) i0] + (t[(size_t) a0 + 1][(size_t) i0 + 1] - t[(size_t) a0 + 1][(size_t) i0]) * inf;
+        return lo + (hi - lo) * af;
+    }
+
+    static float measureDb (int focus, bool alt, float amount, float inputDb)
+    {
+        constexpr double fs = 48000.0;
+        constexpr int period = 48;
+        constexpr int warmup = period * 30, measure = period * 10;
+        const double amp = std::sqrt (2.0) * std::pow (10.0, (AutoGainTable::referenceDbfs + inputDb) / 20.0);
+
+        SvfState band;
+        SvfCoeffs bandCoeffs;
+        if (focus == (int) ParallelFocus::Low)
+            bandCoeffs = svf::lowpass (kParallelLowHz, 0.70710678, fs);
+        else if (focus == (int) ParallelFocus::High)
+            bandCoeffs = svf::highpass (kParallelHighHz, 0.70710678, fs);
+        const chain::ParallelCurve curve (alt);
+
+        double sumS = 0.0, sumS2 = 0.0, sumX2 = 0.0;
+        for (int n = 0; n < warmup + measure; ++n)
+        {
+            const double x = amp * std::sin (2.0 * kPi * (double) (n % period) / (double) period);
+            const double b = focus == (int) ParallelFocus::Flat ? x : (double) band.process ((float) x, bandCoeffs);
+            const double s = x + amount * curve.contribution (b);
+            if (n >= warmup)
+            {
+                sumS += s;
+                sumS2 += s * s;
+                sumX2 += x * x;
+            }
+        }
+        const double meanS = sumS / measure;
+        const double varS = std::max (1.0e-30, sumS2 / measure - meanS * meanS);
+        return (float) (10.0 * std::log10 (varS / (sumX2 / measure)));
+    }
+
+private:
+    ParallelGainTable()
+    {
+        for (int f = 0; f < kNumParallelFocus; ++f)
+            for (int a = 0; a < 2; ++a)
+                for (int m = 0; m < numAmount; ++m)
+                    for (int i = 0; i < numInput; ++i)
+                        table[(size_t) f][(size_t) a][(size_t) m][(size_t) i] = measureDb (
+                            f, a == 1, (float) m / (float) (numAmount - 1), minInputDb + inputStepDb * (float) i);
+    }
+
+    std::array<std::array<std::array<std::array<float, numInput>, numAmount>, 2>, kNumParallelFocus> table {};
+};
+
+//==============================================================================
 class SaturatorEngine
 {
 public:
     static constexpr int kChunk = 64;     // internal block size (any host block size works)
     static constexpr int kMaxChannels = 2;
     static constexpr int kMaxDelay = 256; // >= max latency in samples
+    static constexpr int kMaxHigh = kChunk * Oversampler::maxFactor;
 
-    SaturatorEngine() : autoGainTable (&AutoGainTable::get())
+    SaturatorEngine()
+        : autoGainTable (&AutoGainTable::get()), parallelTable (&ParallelGainTable::get())
     {
         (void) halfband::Designs::get();
     }
@@ -181,10 +312,14 @@ public:
         mix.prepare (fs, 0.05);
         outputDb.prepare (fs, 0.05);
         autoAmount.prepare (fs, 0.05);
+        parallelAmount.prepare (fs, 0.05);
+        airAmount.prepare (fs, 0.03);
 
         fadeStep = 1.0f / (float) std::max (1.0, fs * 0.006);    // 6 ms switch fades
         bypassStep = 1.0f / (float) std::max (1.0, fs * 0.012);  // 12 ms bypass crossfade
+        parFadeStep = 1.0f / (float) std::max (1.0, fs * 0.010); // 10 ms parallel voicing fades
         settleSamples = (int) (fs * 0.002) + kChunk;
+        airCoeffs = svf::highShelf (kAirHz, kAirQ, kAirDb, fs);
 
         for (auto& c : channels)
         {
@@ -215,7 +350,7 @@ public:
     void reset() noexcept
     {
         for (LinearSmoother* s : { &inputDb, &driveDb, &character, &tone, &lowCutLog, &highCutLog,
-                                   &highCutOn, &mix, &outputDb, &autoAmount })
+                                   &highCutOn, &mix, &outputDb, &autoAmount, &parallelAmount, &airAmount })
             s->setImmediate (s->getTarget());
 
         resetWet();
@@ -229,6 +364,10 @@ public:
         bypassAmount = bypassTarget ? 1.0f : 0.0f;
         bypassState = bypassTarget ? BypassState::Bypassed : BypassState::Active;
         preRollCount = 0;
+
+        parFade = 1.0f;
+        parFadeState = DuckState::Idle;
+        parallelWasOn = false;
         coeffsDirty = true;
     }
 
@@ -255,6 +394,8 @@ public:
         set (mix, clampValue (p.mix, 0.0f, 1.0f));
         set (outputDb, clampValue (p.outputDb, -24.0f, 24.0f));
         set (autoAmount, p.autoGain ? 1.0f : 0.0f);
+        set (parallelAmount, clampValue (p.parallel, 0.0f, 1.0f));
+        set (airAmount, p.air ? 1.0f : 0.0f);
         bypassTarget = p.bypass;
 
         Discrete d;
@@ -264,14 +405,20 @@ public:
         d.stereo = clampValue (p.stereoMode, 0, 1);
         pending = d;
 
+        pendingVoicing.focus = clampValue (p.parallelFocus, 0, kNumParallelFocus - 1);
+        pendingVoicing.alt = p.parallelAlt;
+
         if (immediate)
         {
             coeffsDirty = true;
             if (prepared)
             {
                 applyDiscrete (pending);
+                applyVoicing (pendingVoicing);
                 duck = 1.0f;
                 duckState = DuckState::Idle;
+                parFade = 1.0f;
+                parFadeState = DuckState::Idle;
             }
         }
     }
@@ -304,13 +451,26 @@ public:
     }
 
     // Static transfer curve for UI display: output for input x (full scale = 1).
-    static float evaluateStaticCurve (int style, float x, float totalDriveDb, float characterAmount) noexcept
+    // The parallel path is included for focus Low / Flat (both pass DC).
+    static float evaluateStaticCurve (int style, float x, float totalDriveDb, float characterAmount,
+                                      float parallel = 0.0f, int focus = 1, bool alt = false) noexcept
     {
         const auto& spec = getStyleSpec ((StyleId) style);
+        const double ch = clampValue (characterAmount, 0.0f, 1.0f);
+        double in = x;
+        if (parallel > 0.0f && focus != (int) ParallelFocus::High)
+            in += parallel * chain::ParallelCurve (alt).contribution (x);
+
         const double g = std::pow (10.0, totalDriveDb / 20.0) * spec.sensitivity;
-        const double b = spec.biasScale * clampValue (characterAmount, 0.0f, 1.0f);
-        const double norm = 1.0 / curveSlope (spec.curve, b);
-        return (float) (norm * (curveF (spec.curve, x * g + b) - curveF (spec.curve, b)) / spec.sensitivity);
+        const double b1 = spec.biasScale * ch;
+        double y = chain::biasedCurve (spec.curve, in * g, b1, 1.0 / curveSlope (spec.curve, b1));
+        if (spec.twoStage)
+        {
+            const double g2 = std::pow (10.0, spec.stage2MaxDriveDb * ch / 20.0);
+            const double b2 = spec.stage2BiasScale * ch;
+            y = chain::biasedCurve (spec.curve2, y * g2, b2, 1.0 / curveSlope (spec.curve2, b2)) / g2;
+        }
+        return (float) (y / spec.sensitivity);
     }
 
 private:
@@ -324,6 +484,13 @@ private:
         }
     };
 
+    struct Voicing
+    {
+        int focus = 1;
+        bool alt = false;
+        bool operator== (const Voicing& o) const noexcept { return focus == o.focus && alt == o.alt; }
+    };
+
     enum class DuckState { Idle, Out, Hold, In };
     enum class BypassState { Active, Bypassing, Bypassed, PreRoll };
 
@@ -331,17 +498,28 @@ private:
     {
         Oversampler os;
         DelayLine dry, wetPad;
-        SvfState lowCut, toneLow, toneHigh, highCut;
+        SvfState lowCut, toneLow, toneHigh, highCut, air, parBand, parLimit, interstage;
         StaticFilter pre[2], post[3];
         OnePole tapeLP;
         DcBlocker dc;
         EnvelopeFollower env;
-        AdaaState adaa;
+        AdaaState adaa, adaa2, adaaPar;
 
-        std::array<float, kChunk> wet {}, dryOut {}, envBuf {}, biasBuf {}, offBuf {};
+        std::array<float, kChunk> wet {}, dryOut {}, envBuf {}, biasBuf {}, offBuf {}, bias2Buf {}, off2Buf {};
+        std::array<float, kMaxHigh> parBuf {}, parLin {}, parBandBuf {};
     };
 
     //==============================================================================
+    void resetParallel() noexcept
+    {
+        for (auto& c : channels)
+        {
+            c.parBand.reset();
+            c.parLimit.reset();
+            c.adaaPar.reset();
+        }
+    }
+
     void resetWet() noexcept
     {
         for (auto& c : channels)
@@ -352,6 +530,7 @@ private:
             c.toneLow.reset();
             c.toneHigh.reset();
             c.highCut.reset();
+            c.air.reset();
             for (auto& f : c.pre)
                 f.reset();
             for (auto& f : c.post)
@@ -360,7 +539,32 @@ private:
             c.dc.reset();
             c.env.reset();
             c.adaa.reset();
+            c.adaa2.reset();
+            c.interstage.reset();
         }
+        resetParallel();
+    }
+
+    void updateParallelBand() noexcept
+    {
+        const double fsHigh = fs * (double) (1 << stagesFor (active.quality));
+        interstageCoeffs = svf::lowpass (std::min (kInterstageHz, 0.4 * fsHigh), 0.70710678, fsHigh);
+        if (voicing.focus == (int) ParallelFocus::Low)
+            parBandCoeffs = svf::lowpass (kParallelLowHz, 0.70710678, fsHigh);
+        else if (voicing.focus == (int) ParallelFocus::High)
+            parBandCoeffs = svf::highpass (kParallelHighHz, 0.70710678, fsHigh);
+    }
+
+    void applyVoicing (const Voicing& v) noexcept
+    {
+        voicing = v;
+        const chain::ParallelCurve curve (v.alt);
+        parallelGain = (float) curve.gain;
+        parBias.fill ((float) curve.bias);
+        parNorm.fill ((float) curve.norm);
+        parOffset.fill ((float) curve.offset);
+        updateParallelBand();
+        resetParallel();
     }
 
     void applyDiscrete (const Discrete& d) noexcept
@@ -382,6 +586,7 @@ private:
             c.wetPad.setDelay (pad);
             c.dry.setDelay (modeLatency[(size_t) ph]); // the jump happens while muted
         }
+        updateParallelBand(); // depends on the oversampled rate
         resetWet();
     }
 
@@ -434,6 +639,23 @@ private:
         }
     }
 
+    // Parallel voicing changes fade only the parallel contribution (the main path keeps playing).
+    void advanceParallelFade (int n) noexcept
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            if (parFadeState == DuckState::Out)
+                parFade = std::max (0.0f, parFade - parFadeStep);
+            else if (parFadeState == DuckState::In)
+            {
+                parFade = std::min (1.0f, parFade + parFadeStep);
+                if (parFade >= 1.0f)
+                    parFadeState = DuckState::Idle;
+            }
+            ctlParFade[(size_t) i] = parFade;
+        }
+    }
+
     // Bypass crossfade; when leaving a full bypass the wet path pre-rolls (muted) first.
     void advanceBypass (int n) noexcept
     {
@@ -474,6 +696,15 @@ private:
         else if (duckState == DuckState::In && ! (pending == active))
             duckState = DuckState::Out;
 
+        // ---- parallel voicing changes (focus / alt): fade the parallel path only
+        if (parFadeState == DuckState::Out && parFade <= 0.0f)
+        {
+            applyVoicing (pendingVoicing);
+            parFadeState = DuckState::In;
+        }
+        if ((parFadeState == DuckState::Idle || parFadeState == DuckState::In) && ! (pendingVoicing == voicing))
+            parFadeState = DuckState::Out;
+
         // ---- bypass state transitions
         if (bypassTarget)
         {
@@ -494,6 +725,7 @@ private:
         }
 
         advanceDuck (n);
+        advanceParallelFade (n);
         advanceBypass (n);
         updateCoefficients (n);
 
@@ -509,17 +741,21 @@ private:
             {
                 // keep the smoothers moving so nothing jumps when coming back
                 inputDb.next(); driveDb.next(); character.next(); highCutOn.next();
-                mix.next(); outputDb.next(); autoAmount.next();
+                mix.next(); outputDb.next(); autoAmount.next(); parallelAmount.next(); airAmount.next();
             }
             for (int c = 0; c < nch; ++c)
                 for (int i = 0; i < n; ++i)
                     io[c][i] = channels[(size_t) c].dryOut[(size_t) i] * ctlDuck[(size_t) i];
+            parallelWasOn = false;
             return;
         }
 
         // ---- shared per-sample controls
         const CurveId curve = spec->curve;
+        const CurveId curve2 = spec->curve2;
+        const bool twoStage = spec->twoStage;
         const float sens = spec->sensitivity;
+        float parallelPeak = 0.0f;
         for (int i = 0; i < n; ++i)
         {
             const float inDb = inputDb.next();
@@ -529,17 +765,37 @@ private:
             ctlDrive[(size_t) i] = dbToGain (drDb) * sens;
             ctlChar[(size_t) i] = ch;
 
-            const float bStatic = spec->biasScale * ch;
-            ctlBias[(size_t) i] = bStatic;
-            ctlNorm[(size_t) i] = (float) (1.0 / curveSlope (curve, bStatic));
-            ctlOffset[(size_t) i] = (float) curveF (curve, bStatic);
+            const float b1 = spec->biasScale * ch;
+            ctlBias[(size_t) i] = b1;
+            ctlNorm[(size_t) i] = (float) (1.0 / curveSlope (curve, b1));
+            ctlOffset[(size_t) i] = (float) curveF (curve, b1);
 
-            const float compDb = autoGainTable->lookupDb (active.style, inDb + drDb, ch);
+            if (twoStage)
+            {
+                const float g2 = dbToGain (spec->stage2MaxDriveDb * ch);
+                const float b2 = spec->stage2BiasScale * ch;
+                ctlG2[(size_t) i] = g2;
+                ctlBias2[(size_t) i] = b2;
+                ctlNorm2[(size_t) i] = (float) (1.0 / (curveSlope (curve2, b2) * (double) g2));
+            }
+
+            const float parAmt = parallelAmount.next() * ctlParFade[(size_t) i];
+            ctlParMix[(size_t) i] = parAmt;
+            parallelPeak = std::max (parallelPeak, parAmt);
+            const float parDb = parAmt > 0.0f ? parallelTable->lookupDb (voicing.focus, voicing.alt, parAmt, inDb) : 0.0f;
+
+            const float compDb = autoGainTable->lookupDb (active.style, inDb + drDb + parDb, ch);
             ctlOutScale[(size_t) i] = dbToGain (autoAmount.next() * compDb) / sens;
             ctlMix[(size_t) i] = mix.next();
             ctlOut[(size_t) i] = dbToGain (outputDb.next());
             ctlHcOn[(size_t) i] = highCutOn.next();
+            ctlAir[(size_t) i] = airAmount.next();
         }
+
+        const bool parallelOn = parallelPeak > 0.0f;
+        if (parallelOn && ! parallelWasOn)
+            resetParallel(); // start clean; the amount ramps in from zero
+        parallelWasOn = parallelOn;
 
         const bool midSide = (active.stereo == (int) StereoMode::MidSide) && nch == 2;
         const bool sag = spec->sagAmount > 0.0f;
@@ -570,7 +826,16 @@ private:
                 const float e = st.env.process (u);
                 st.envBuf[(size_t) i] = e;
 
-                if (sag)
+                if (twoStage)
+                {
+                    st.biasBuf[(size_t) i] = ctlBias[(size_t) i];
+                    st.offBuf[(size_t) i] = ctlOffset[(size_t) i];
+                    const float b2 = sag ? clampValue (ctlBias2[(size_t) i] + sagAmount * ctlChar[(size_t) i] * e, -1.2f, 1.2f)
+                                         : ctlBias2[(size_t) i];
+                    st.bias2Buf[(size_t) i] = b2;
+                    st.off2Buf[(size_t) i] = (float) curveF (curve2, b2);
+                }
+                else if (sag)
                 {
                     const float b = clampValue (ctlBias[(size_t) i] + sagAmount * ctlChar[(size_t) i] * e, -1.2f, 1.2f);
                     st.biasBuf[(size_t) i] = b;
@@ -585,17 +850,78 @@ private:
             }
         }
 
-        // ---- oversampled curve
+        // ---- oversampled: parallel saturation -> curve -> (stage 2)
+        const bool flatFocus = voicing.focus == (int) ParallelFocus::Flat;
         for (int c = 0; c < nch; ++c)
         {
             auto& st = channels[(size_t) c];
             float* hi = st.os.processUp (st.wet.data(), n);
-            processCurveBlock (curve, hi, n, st.os.getFactor(), st.biasBuf.data(), ctlNorm.data(),
-                               st.offBuf.data(), st.adaa);
+            const int factor = st.os.getFactor();
+
+            if (parallelOn)
+            {
+                // The linear part of the parallel path (band * kParallelLinear) is added straight;
+                // only the nonlinear residual (harmonics + compression) is band-limited before it
+                // meets the main curve. The residual is taken against the exact small-signal
+                // output of the ADAA curve (mean of consecutive inputs), so the dry band and the
+                // band inside the parallel curve stay aligned and the response stays flat.
+                float* pb = st.parBuf.data();
+                float* lin = st.parLin.data();
+                float* band = st.parBandBuf.data();
+                for (int m = 0; m < n; ++m)
+                {
+                    const float toPar = parallelGain / ctlDrive[(size_t) m]; // back to pre-drive level
+                    for (int k = 0; k < factor; ++k)
+                    {
+                        const int idx = m * factor + k;
+                        const float b = flatFocus ? hi[idx] : st.parBand.process (hi[idx], parBandCoeffs);
+                        band[idx] = b;
+                        pb[idx] = b * toPar;
+                    }
+                }
+                float prevIn = (float) st.adaaPar.vPrev;
+                for (int idx = 0; idx < n * factor; ++idx)
+                {
+                    lin[idx] = 0.5f * (pb[idx] + prevIn);
+                    prevIn = pb[idx];
+                }
+                processCurveBlock<TanhCurve> (pb, n, factor, parBias.data(), parNorm.data(), parOffset.data(), st.adaaPar);
+
+                const float invGain = 1.0f / parallelGain;
+                for (int m = 0; m < n; ++m)
+                {
+                    const float a = ctlParMix[(size_t) m];
+                    const float aLin = a * kParallelLinear;
+                    const float aRes = a * ctlDrive[(size_t) m];
+                    for (int k = 0; k < factor; ++k)
+                    {
+                        const int idx = m * factor + k;
+                        const float residual = pb[idx] - lin[idx] * invGain;
+                        hi[idx] += aLin * band[idx] + aRes * st.parLimit.process (residual, interstageCoeffs);
+                    }
+                }
+            }
+
+            processCurveBlock (curve, hi, n, factor, st.biasBuf.data(), ctlNorm.data(), st.offBuf.data(), st.adaa);
+
+            if (twoStage)
+            {
+                for (int m = 0; m < n; ++m)
+                {
+                    const float g2 = ctlG2[(size_t) m];
+                    for (int k = 0; k < factor; ++k)
+                    {
+                        const int idx = m * factor + k;
+                        hi[idx] = g2 * st.interstage.process (hi[idx], interstageCoeffs);
+                    }
+                }
+                processCurveBlock (curve2, hi, n, factor, st.bias2Buf.data(), ctlNorm2.data(), st.off2Buf.data(), st.adaa2);
+            }
+
             st.os.processDown (st.wet.data(), n);
         }
 
-        // ---- post: DC block, style post-EQ, tone, high cut, auto gain, quality padding
+        // ---- post: DC block, style post-EQ, air, tone, high cut, auto gain, quality padding
         for (int c = 0; c < nch; ++c)
         {
             auto& st = channels[(size_t) c];
@@ -610,6 +936,8 @@ private:
                     st.tapeLP.setCutoff (std::max (kTapeHfMinHz, kTapeHfMaxHz / (1.0 + hfAmount * st.envBuf[(size_t) i])), fs);
                     y = st.tapeLP.lowpass (y);
                 }
+                const float ya = st.air.process (y, airCoeffs);
+                y += ctlAir[(size_t) i] * (ya - y);
                 y = st.toneLow.process (y, toneLowCoeffs);
                 y = st.toneHigh.process (y, toneHighCoeffs);
                 const float yh = st.highCut.process (y, highCutCoeffs);
@@ -657,6 +985,7 @@ private:
 
     //==============================================================================
     const AutoGainTable* autoGainTable = nullptr;
+    const ParallelGainTable* parallelTable = nullptr;
     const StyleSpec* spec = &getStyleSpec (StyleId::Tube);
 
     double fs = 48000.0;
@@ -664,15 +993,20 @@ private:
     bool prepared = false;
 
     LinearSmoother inputDb, driveDb, character, tone, lowCutLog, highCutLog, highCutOn,
-                   mix, outputDb, autoAmount;
+                   mix, outputDb, autoAmount, parallelAmount, airAmount;
     bool coeffsDirty = true;
 
-    SvfCoeffs lowCutCoeffs, highCutCoeffs, toneLowCoeffs, toneHighCoeffs;
+    SvfCoeffs lowCutCoeffs, highCutCoeffs, toneLowCoeffs, toneHighCoeffs, airCoeffs, parBandCoeffs, interstageCoeffs;
 
     Discrete active, pending;
     DuckState duckState = DuckState::Idle;
     float duck = 1.0f, fadeStep = 0.004f;
     int holdCount = 0, settleSamples = 160;
+
+    Voicing voicing, pendingVoicing;
+    DuckState parFadeState = DuckState::Idle;
+    float parFade = 1.0f, parFadeStep = 0.002f, parallelGain = 4.0f;
+    bool parallelWasOn = false;
 
     bool bypassTarget = false;
     BypassState bypassState = BypassState::Active;
@@ -686,6 +1020,8 @@ private:
     std::array<Channel, kMaxChannels> channels;
 
     std::array<float, kChunk> ctlDuck {}, ctlIn {}, ctlDrive {}, ctlChar {}, ctlBias {}, ctlNorm {},
-                              ctlOffset {}, ctlOutScale {}, ctlMix {}, ctlOut {}, ctlBypass {}, ctlHcOn {};
+                              ctlOffset {}, ctlOutScale {}, ctlMix {}, ctlOut {}, ctlBypass {}, ctlHcOn {},
+                              ctlG2 {}, ctlBias2 {}, ctlNorm2 {}, ctlParMix {}, ctlParFade {}, ctlAir {},
+                              parBias {}, parNorm {}, parOffset {};
 };
 } // namespace pillow::dsp

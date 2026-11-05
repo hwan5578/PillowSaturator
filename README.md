@@ -1,4 +1,4 @@
-# Pillow Saturator (v0.1)
+# Pillow Saturator (v0.2)
 
 Pillow Audio의 세츄레이션 플러그인입니다. JUCE 8 기반이며 VST3, AU(macOS), Standalone으로 빌드됩니다.
 Saturn 2, Decapitator, Clariphonic 분석에서 얻은 공통 패턴을 따르되, 곡선과 튜닝은 모두 새로 설계했습니다.
@@ -13,10 +13,13 @@ Saturn 2, Decapitator, Clariphonic 분석에서 얻은 공통 패턴을 따르�
 
 ```
 In → Input → [M/S] → Low Cut → 스타일 Pre-EQ → Drive → 엔벨로프/바이어스
-   → ↑오버샘플 → 곡선(ADAA) → ↓다운샘플 (+정확한 지연 패딩) → DC 제거
-   → 스타일 Post-EQ → Tone(틸트) → High Cut → Auto Gain → [M/S 복원]
+   → ↑오버샘플 → [+ 패러렐 세츄레이션 (Focus 대역)] → 곡선(ADAA) [→ Glow 2단]
+   → ↓다운샘플 (+정확한 지연 패딩) → DC 제거
+   → 스타일 Post-EQ → Air → Tone(틸트) → High Cut → Auto Gain → [M/S 복원]
    → Mix(지연 맞춘 드라이와 혼합) → Output → 바이패스/전환 페이드 → Out
 ```
+
+- 패러렐 경로는 메인 곡선 **앞**에서 합쳐집니다. 그래서 패러렐이 만든 배음도 선택한 스타일을 한 번 더 거칩니다.
 
 ## 파라미터
 
@@ -24,8 +27,8 @@ In → Input → [M/S] → Low Cut → 스타일 Pre-EQ → Drive → 엔벨로�
 |---|---|---|---|
 | Input | −24 … +24 dB | 0 dB | 입력 레벨 (Auto Gain이 켜져 있으면 세츄레이션 양만 바뀜) |
 | Drive | 0 … +36 dB | +6 dB | 곡선에 들어가는 레벨 |
-| Style | Tube / Tape / Transformer / Clean | Tube | 아래 표 참고 |
-| Character | 0 … 100 % | 35 % | 0 %는 홀수 배음만, 올릴수록 짝수 배음(비대칭) |
+| Style | Tube / Tape / Transformer / Clean / Glow | Tube | 아래 표 참고 |
+| Character | 0 … 100 % | 35 % | 0 %는 홀수 배음만, 올릴수록 짝수 배음(비대칭). Glow에서는 UI 이름이 **2ND STAGE**로 바뀌고 2단의 드라이브·비대칭·새그를 올림 |
 | Tone | Dark 100 … Bright 100 | Flat | 700 Hz 기준 틸트 EQ (±4.5 dB 셸프 한 쌍) |
 | Low Cut | 10 Hz … 1 kHz | 10 Hz | 세츄레이션 **앞** 12 dB/oct 하이패스 |
 | High Cut | 1 kHz … 20 kHz / Off | Off | 세츄레이션 **뒤** 12 dB/oct 로우패스 |
@@ -35,10 +38,14 @@ In → Input → [M/S] → Low Cut → 스타일 Pre-EQ → Drive → 엔벨로�
 | Quality | Normal 2x / High 4x / Ultra 8x | High | 오버샘플링 배수. 88.2 kHz 이상에서는 자동으로 절반, 176.4 kHz 이상에서는 1/4 (최소 2x) |
 | Linear Phase | On / Off | Off | 선형 위상 오버샘플링 필터 |
 | Stereo Mode | Stereo / Mid-Side | Stereo | M/S 모드에서는 Mid와 Side를 따로 세츄레이션 |
+| Parallel | 0 … 100 % | 0 % | 패러렐 세츄레이션 양 (아래 설명) |
+| Parallel Focus | Low / Flat / High | Flat | 패러렐 경로가 듣는 대역: Low = 350 Hz 이하, Flat = 전 대역, High = 2.2 kHz 이상 |
+| Parallel Alt | On / Off | Off | 더 뜨겁고(+6 dB) 더 비대칭인 패러렐 보이싱 |
+| Air | On / Off | Off | 세츄레이션 뒤 부드러운 고역 셸프 (1 kHz +0.0, 12 kHz +1.5, 16 kHz +2.6, 19 kHz +3.3 dB) |
 
 ## 스타일 설계
 
-네 스타일은 같은 골격을 쓰고 레시피만 다릅니다. 레시피는 `Source/dsp/Styles.h` 한 곳에 모여 있습니다.
+다섯 스타일은 같은 골격을 쓰고 레시피만 다릅니다. 레시피는 `Source/dsp/Styles.h` 한 곳에 모여 있습니다.
 Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평탄하고 어느 대역이 먼저 포화되는지만 바뀝니다.
 
 | 스타일 | 곡선 | EQ 설계 | 동적 요소 |
@@ -47,6 +54,17 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
 | Tape | x/√(1+x²) (부드러운 무릎) | 3 kHz 셸프 ±7 dB 엠퍼시스(고역이 먼저 포화), 55 Hz 헤드 범프 +1.5 dB, 18 Hz HP | 레벨이 커질수록 고역 손실 (19 kHz → 최저 5 kHz) |
 | Transformer | tanh | 160 Hz 셸프 ±9 dB 엠퍼시스(저역이 먼저 포화), 17 kHz +0.7 dB 공진, 12 Hz HP | 없음 (주파수 의존 포화 자체가 핵심) |
 | Clean | 3차 소프트 클립 (±1.5에서 천장) | 없음 | 없음. 가장 투명함 |
+| Glow | 2단 직렬: 1단 tanh(대칭, Drive) → 2단 소프트(비대칭, 2ND STAGE 0…+15 dB) | 110 Hz 셸프 ±3 dB 엠퍼시스(저역 무게감), 90 Hz +0.7 dB, 20 Hz HP | 2단에 **새그**. 단 사이 30 kHz 대역 제한(진공관 단의 대역폭처럼, 1단의 초고역 배음이 2단에서 에일리어싱으로 접히지 않게 함) |
+
+### 패러렐 세츄레이션
+
+- Focus로 고른 대역의 복사본을 별도의 진공관형 곡선에 세게(기본 +12 dB, Alt +18 dB와 큰 바이어스) 넣습니다.
+- Amount는 그 대역을 깨끗한 소리에서 포화된 소리로 서서히 바꾸고, 그 대역을 살짝(100 %에서 +1.9 dB) 강조합니다.
+  - 그래서 Focus는 큰 셸프 EQ처럼 동작하지 않습니다. **배음이 어느 대역에서 생기는지**를 바꿉니다.
+  - 예: Low는 베이스의 배음과 무게감, High는 고역의 반짝임과 bite.
+- 선형 성분은 지연·필터 없이 그대로 더하고, 비선형 잔차(배음과 압축)만 30 kHz로 대역 제한합니다. 그래서 Quality와 무관하게 응답이 평탄합니다. 작은 신호 기준으로 Flat은 60 Hz–19.5 kHz에서 ±0.00 dB입니다.
+- Focus와 Alt를 바꾸면 패러렐 경로만 10 ms 동안 페이드됩니다. 메인 소리는 끊기지 않습니다.
+- Auto Gain은 패러렐을 드라이브 증가로 환산해서 보정합니다.
 
 ## 측정 결과
 
@@ -60,12 +78,25 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
 | Tape | 0.74 % | 3.7 % | 15 % (가장 부드러움) |
 | Transformer | 1.2 % | 5.4 % | 25 % |
 | Clean | 0.33 % | 2.05 % | 26 % |
+| Glow | 3.0 % (H2 −32, H3 −37 dB) | 13.9 % | 34 % (가장 진함) |
 
 - Character 0 %에서는 모든 스타일의 짝수 배음이 −175 dB 이하입니다 (순수 홀수 배음).
 - 주파수 의존성 (Drive +12 dB, H3 기준)
   - Transformer: 60 Hz −12.7 dB, 1 kHz −28 dB. 저역이 15 dB 더 포화됩니다.
   - Tape: 5 kHz −26 dB, 1 kHz −30 dB. 고역이 더 포화됩니다.
 - Auto Gain: 모든 스타일에서 Drive 0~36 dB, Character 0/50/100 % 전 구간 동안 출력 레벨이 입력 대비 ±0.05 dB 이내입니다.
+  - 패러렐을 켰을 때(Drive 6/18 dB, Input 0/+12 dB, Amount 50/100 %)는 최악 +0.44 dB(Flat)입니다. Low와 High는 ±0.05 dB 이내입니다.
+
+**패러렐 세츄레이션** (Clean, Drive 0, Character 0, Amount 100 %, −18 dBFS)
+
+| Focus | 60 Hz THD | 1 kHz THD | 5 kHz THD |
+|---|---|---|---|
+| 꺼짐 | 0.10 % | 0.10 % | 0.09 % |
+| Low | **4.45 %** | 0.12 % | 0.09 % |
+| Flat | 4.46 % | **4.44 %** | 4.22 % |
+| High | 0.10 % | 0.25 % | **4.25 %** |
+
+- Alt를 켜면 Flat 1 kHz THD가 4.4 % → 11.7 %로 오르고, H2가 −29 → −21 dB로 커집니다.
 
 **에일리어싱** (7 kHz, −6 dBFS 피크, Drive +18 dB, 48 kHz에서 가청대역 최악값)
 
@@ -75,6 +106,10 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
 | Tape | −57 dB | −84 dB | −109 / −119 dB |
 | Transformer | −53 dB | −110 dB | −120 / −142 dB |
 | Clean | −63 dB | −90 dB | −119 / −123 dB |
+| Glow | −55 dB | −87 dB | −114 / −129 dB |
+| Glow + 패러렐 Alt 100 % | −57 dB | −106 dB | −110 / −128 dB |
+
+- 2단 직렬이나 패러렐처럼 곡선이 겹치면 배음이 더 많이 생깁니다. 그래서 Glow는 **High(4x) 이상**을 권장합니다.
 
 **지연**
 
@@ -92,13 +127,14 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
 
 | Quality | 최소 위상 | 선형 위상 |
 |---|---|---|
-| Normal (2x) | 0.8–1.6 % | 1.7–2.5 % |
-| High (4x) | 1.2–2.3 % | 2.1–3.2 % |
-| Ultra (8x) | 2.0–3.9 % | 2.8–5.1 % |
+| Normal (2x) | 0.9–1.6 % | 1.2–2.5 % |
+| High (4x) | 1.1–2.8 % | 1.8–3.8 % |
+| Ultra (8x) | 1.8–6.0 % | 2.7–5.8 % |
+| Glow + 패러렐 + Air (최대 부하) | 2.6 / 5.0 / 6.8 % (2x/4x/8x) | 3.1 / 4.3 / 7.0 % |
 
 **안정성**
 - 랜덤 오토메이션 400블록 × 샘플레이트 4종 × 모노/스테레오에서 NaN과 Inf가 0건이었습니다.
-- 스타일, Quality, 위상, 스테레오 전환과 바이패스 토글 28회 동안 클릭이 없었습니다 (샘플 간 최대 변화 0.005).
+- 스타일, Quality, 위상, 스테레오, 패러렐 Focus/Alt, Air 전환과 바이패스 토글 28회 동안 클릭이 없었습니다 (샘플 간 최대 변화 0.005).
 
 ## VST3 검증 결과
 
@@ -106,9 +142,10 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
 
 - **Steinberg 공식 VST3 validator** (VST3 SDK 3.8.1): 표준 **47/47**, 확장 모드(`-e`) **537/537** 통과
 - **호스트 로드 테스트**: DAW처럼 플러그인을 불러와 파라미터를 텍스트로 설정하고 오디오를 처리했습니다.
-  - THD가 엔진 측정값과 소수점 둘째 자리까지 일치합니다 (예: Tube +24 dB = 25.18 %).
+  - THD가 엔진 측정값과 소수점 둘째 자리까지 일치합니다 (예: Tube +24 dB = 25.18 %, Glow +12 dB = 13.94 %, 패러렐 Low 60 Hz = 4.45 %).
   - Auto Gain 출력이 −18.00 dBFS로 유지됩니다.
-  - 지연 6/73 샘플과 상태 저장·복원도 확인했습니다.
+  - Air는 1 kHz +0.01 dB, 16 kHz +2.55 dB입니다.
+  - 지연 6/73 샘플과 상태 저장·복원(새 파라미터 포함)도 확인했습니다.
 
 ## Windows VST3 받기 — 방법 1: GitHub Actions (내 PC에 도구 설치 불필요)
 
@@ -119,6 +156,7 @@ Pre/Post 셸프는 정확한 역필터 쌍이라서, 작은 신호에서는 평�
    - `.github` 폴더가 꼭 포함되어야 합니다.
 2. 저장소의 **Actions** 탭 → **Build** 실행이 끝날 때까지 기다립니다. 처음에는 약 10–20분 걸립니다.
 3. 실행 결과 아래 **Artifacts**에서 `PillowSaturator-Windows-VST3`를 내려받아 압축을 풉니다.
+   - main에 푸시한 빌드는 `builds` 브랜치에도 zip으로 올라갑니다.
 4. `Pillow Saturator.vst3`를 `C:\Program Files\Common Files\VST3\`에 복사하고, Cubase에서 다시 스캔합니다.
 
 ## Windows VST3 받기 — 방법 2: 내 PC에서 빌드
@@ -162,17 +200,24 @@ tests/EngineTests.cpp  ← 측정·회귀 테스트
   - Auto Gain 테이블은 시작할 때 레시피로부터 자동 계산되므로 따로 맞출 필요가 없습니다.
 - 바꾼 뒤에는 `PillowEngineTests`를 다시 돌려 배음, Auto Gain, 에일리어싱이 원하는 범위인지 확인하세요.
 - 새 스타일을 추가하려면 `kNumStyles`를 늘리고, 레시피 하나를 넣고, `Parameters.h`의 `styleNames()`에 이름을 추가하면 됩니다.
+- Glow의 2단은 `twoStage`, `curve2`, `stage2MaxDriveDb`, `stage2BiasScale`로 조절합니다.
+- 패러렐은 `Styles.h` 위쪽에 모여 있습니다.
+  - 보이싱(드라이브, 바이어스)은 `getParallelVoicing`에 있습니다.
+  - Focus 주파수는 `kParallelLowHz`와 `kParallelHighHz`입니다.
+  - 대역 강조량은 `kParallelLinear`입니다.
+  - 단 사이 대역 제한은 `kInterstageHz`입니다.
 
 ## 알아둘 점
 
 - **플러그인 코드**: `PLUGIN_MANUFACTURER_CODE`(Pilw)는 다른 Pillow 플러그인과 **같은 값**이어야 합니다. `PLUGIN_CODE`(PSat)는 출시 후 절대 바꾸지 마세요. 바꾸면 기존 세션에서 플러그인을 찾지 못합니다.
 - **파라미터 ID**: `Parameters.h`의 ID도 출시 후에는 바꾸면 안 됩니다. 저장된 세션과 프리셋이 이 ID를 참조합니다.
-- **스위치형 파라미터**: Style, Quality, Linear Phase, Stereo Mode는 바꿀 때 약 15–20 ms 동안 소리를 줄였다가 다시 올립니다. 전환 중 클릭을 막기 위한 동작입니다.
+- **스위치형 파라미터**: Style, Quality, Linear Phase, Stereo Mode는 바꿀 때 약 15–20 ms 동안 소리를 줄였다가 다시 올립니다. 전환 중 클릭을 막기 위한 동작입니다. Parallel Focus와 Alt는 패러렐 경로만 10 ms 페이드합니다.
+- **v0.1 세션 호환**: 저장된 세션과 프리셋은 그대로 열립니다. Style 목록이 4개에서 5개로 늘어서, v0.1에서 Style을 **오토메이션으로 기록**했다면 그 값은 다시 확인해야 합니다.
 - **바이패스**: 호스트 바이패스는 12 ms 크로스페이드로 처리됩니다. 지연 보정이 유지되므로 타이밍이 어긋나지 않습니다.
 - **Auto Gain 기준**: −18 dBFS = 0 VU에서 정확히 맞습니다. 이보다 큰 신호는 자연스럽게 압축되고, 작은 신호는 약간 커집니다.
 - **라이선스**: JUCE 8을 상업적으로 배포하려면 JUCE 라이선스 조건(무료 티어, 상용, AGPLv3)을 확인하세요.
 - **JUCE 버전**: JUCE 9가 이미 나와 있습니다. 이 프로젝트는 JUCE 8.0.17-security 기준이며, 나중에 `PILLOW_JUCE_TAG`로 버전을 올리면 됩니다.
-- **검증 범위**: 실제 JUCE 8.0.17로 VST3를 빌드했고 Steinberg validator와 호스트 테스트를 통과했습니다. 다만 그 빌드는 Linux 빌드였습니다. Windows(MSVC) 빌드와 Cubase 안에서의 화면·동작은 아직 직접 확인하지 못했습니다.
+- **검증 범위**: 실제 JUCE 8.0.17로 VST3를 빌드했고 Steinberg validator와 호스트 테스트를 통과했습니다. 다만 그 빌드는 Linux 빌드였습니다. Windows 빌드는 GitHub Actions(MSVC)에서 엔진 테스트까지 통과하지만, Cubase 안에서의 화면·동작은 아직 직접 확인하지 못했습니다.
 
 ## 다음 단계 아이디어
 

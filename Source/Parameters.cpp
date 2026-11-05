@@ -5,7 +5,9 @@ namespace pillow::params
 {
 namespace
 {
-    constexpr int version = 1; // ParameterID version hint (AU / VST3 parameter ordering)
+    // ParameterID version hint (AU parameter ordering): the plug-in version that added it.
+    constexpr int version = 1;
+    constexpr int version2 = 2;
 
     juce::NormalisableRange<float> logRange (float minValue, float maxValue)
     {
@@ -56,10 +58,11 @@ namespace
                 .withValueFromStringFunction (parseNumber));
     }
 
-    std::unique_ptr<juce::AudioParameterFloat> makePercent (const char* pid, const char* name, float lo, float hi, float def)
+    std::unique_ptr<juce::AudioParameterFloat> makePercent (const char* pid, const char* name, float lo, float hi, float def,
+                                                            int versionHint = version)
     {
         return std::make_unique<juce::AudioParameterFloat> (
-            juce::ParameterID { pid, version }, name, juce::NormalisableRange<float> (lo, hi, 0.1f), def,
+            juce::ParameterID { pid, versionHint }, name, juce::NormalisableRange<float> (lo, hi, 0.1f), def,
             juce::AudioParameterFloatAttributes()
                 .withLabel ("%")
                 .withStringFromValueFunction (formatPercent)
@@ -143,6 +146,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         juce::ParameterID { id::stereoMode, version }, "Stereo Mode",
         juce::StringArray { "Stereo", "Mid/Side" }, 0));
+
+    // ---- parallel saturation + air (0.2.0)
+    layout.add (makePercent (id::parallel, "Parallel", 0.0f, 100.0f, 0.0f, version2));
+
+    layout.add (std::make_unique<juce::AudioParameterChoice> (
+        juce::ParameterID { id::parFocus, version2 }, "Parallel Focus", parallelFocusNames(), (int) ParallelFocus::Flat));
+
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { id::parAlt, version2 }, "Parallel Alt", false));
+
+    layout.add (std::make_unique<juce::AudioParameterBool> (
+        juce::ParameterID { id::air, version2 }, "Air", false));
 
     return layout;
 }

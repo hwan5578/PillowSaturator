@@ -20,11 +20,22 @@ namespace id
     inline constexpr const char* quality     = "quality";
     inline constexpr const char* linearPhase = "linearphase";
     inline constexpr const char* stereoMode  = "stereomode";
+    // added in 0.2.0
+    inline constexpr const char* parallel    = "parallel";
+    inline constexpr const char* parFocus    = "parfocus";
+    inline constexpr const char* parAlt      = "paralt";
+    inline constexpr const char* air         = "air";
 } // namespace id
 
 inline const juce::StringArray& styleNames()
 {
-    static const juce::StringArray names { "Tube", "Tape", "Transformer", "Clean" };
+    static const juce::StringArray names { "Tube", "Tape", "Transformer", "Clean", "Glow" };
+    return names;
+}
+
+inline const juce::StringArray& parallelFocusNames()
+{
+    static const juce::StringArray names { "Low", "Flat", "High" };
     return names;
 }
 

@@ -22,6 +22,10 @@ PillowSaturatorAudioProcessor::PillowSaturatorAudioProcessor()
     pQuality     = apvts.getRawParameterValue (pid::quality);
     pLinearPhase = apvts.getRawParameterValue (pid::linearPhase);
     pStereoMode  = apvts.getRawParameterValue (pid::stereoMode);
+    pParallel    = apvts.getRawParameterValue (pid::parallel);
+    pParFocus    = apvts.getRawParameterValue (pid::parFocus);
+    pParAlt      = apvts.getRawParameterValue (pid::parAlt);
+    pAir         = apvts.getRawParameterValue (pid::air);
 }
 
 //==============================================================================
@@ -61,6 +65,10 @@ pillow::dsp::EngineParams PillowSaturatorAudioProcessor::readParameters() const 
     p.quality     = juce::roundToInt (pQuality->load());
     p.linearPhase = pLinearPhase->load() > 0.5f;
     p.stereoMode  = juce::roundToInt (pStereoMode->load());
+    p.parallel      = pParallel->load() * 0.01f;
+    p.parallelFocus = juce::roundToInt (pParFocus->load());
+    p.parallelAlt   = pParAlt->load() > 0.5f;
+    p.air           = pAir->load() > 0.5f;
     return p;
 }
 

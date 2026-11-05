@@ -1,18 +1,20 @@
 #pragma once
 
-// The four v1 styles. Every style shares one topology:
-//   pre-EQ -> drive -> [oversampled curve with bias] -> DC block -> post-EQ
+// The styles. Every style shares one topology:
+//   pre-EQ -> drive -> [oversampled curve(s) with bias] -> DC block -> post-EQ
 // and differs only in its recipe (curve, EQ around the curve, bias and dynamic behaviour).
 // Pre/post shelves are exact inverses, so at low level each style is (nearly) flat and the
 // EQ only decides which frequencies hit the curve first.
+// Glow chains two stages: a firm, symmetric first stage (Drive) into a soft, biased second
+// stage whose drive / asymmetry / sag follow Character.
 
 #include "Filters.h"
 #include "Shapers.h"
 
 namespace pillow::dsp
 {
-enum class StyleId : int { Tube = 0, Tape, Transformer, Clean };
-constexpr int kNumStyles = 4;
+enum class StyleId : int { Tube = 0, Tape, Transformer, Clean, Glow };
+constexpr int kNumStyles = 5;
 
 struct FilterSpec
 {
@@ -29,11 +31,51 @@ struct StyleSpec
     CurveId curve;
     float sensitivity;   // signal scaling into the curve (calibrated at -18 dBFS = 0 VU)
     float biasScale;     // static bias at Character = 100 %  (even harmonics)
-    float sagAmount;     // dynamic bias per unit of envelope at Character = 100 % (tube "sag")
+    float sagAmount;     // dynamic bias per unit of envelope at Character = 100 % (tube "sag");
+                         // applies to the second stage when twoStage is set
     float hfLossAmount;  // level-dependent HF loss depth (tape), 0 = off
     FilterSpec pre[2];
     FilterSpec post[3];
+
+    // optional second stage (Glow)
+    bool twoStage = false;
+    CurveId curve2 = CurveId::Soft;
+    float stage2MaxDriveDb = 0.0f; // stage-2 drive at Character = 100 %
+    float stage2BiasScale = 0.0f;  // stage-2 bias at Character = 100 %
 };
+
+//==============================================================================
+// Parallel saturation: a band-selected copy of the (pre-drive) signal is driven hard into
+// its own curve and summed into the main path *before* the main curve, so the added
+// harmonics also go through the style. Two voicings; Alt is hotter and more asymmetric.
+// Amount crossfades the focused band from clean to saturated and adds a gentle linear
+// emphasis of that band (kParallelLinear), so Focus changes *where* the harmonics are made
+// rather than acting as a big shelf EQ:
+//   main += amount * (kParallelLinear * band + (sat(band) - band))
+enum class ParallelFocus : int { Low = 0, Flat, High };
+constexpr int kNumParallelFocus = 3;
+constexpr double kParallelLowHz = 350.0, kParallelHighHz = 2200.0;
+constexpr float kParallelLinear = 0.25f; // +1.9 dB emphasis of the focused band at 100 %
+
+struct ParallelVoicing
+{
+    double driveDb;
+    double bias;
+};
+
+inline const ParallelVoicing& getParallelVoicing (bool alt) noexcept
+{
+    static const ParallelVoicing voicings[2] = { { 12.0, 0.15 }, { 18.0, 0.32 } };
+    return voicings[alt ? 1 : 0];
+}
+
+// Air: gentle lift from ~10 kHz rising towards 20 kHz, after the curve.
+constexpr double kAirHz = 14000.0, kAirQ = 0.5, kAirDb = 4.0;
+
+// Band limit (at the oversampled rate) between cascaded curves: after the parallel curve and
+// between the two Glow stages. Like a real tube stage's bandwidth, it stops ultrasonic
+// harmonics of one curve from intermodulating in the next and folding into the audio band.
+constexpr double kInterstageHz = 30000.0;
 
 inline const StyleSpec& getStyleSpec (StyleId id) noexcept
 {
@@ -58,6 +100,14 @@ inline const StyleSpec& getStyleSpec (StyleId id) noexcept
         { "Clean", CurveId::Cubic, 0.90f, 0.25f, 0.0f, 0.0f,
           { {}, {} },
           { {}, {}, {} } },
+
+        // Glow: two tube-like stages in series. Stage 1 (Drive) is firm and symmetric and
+        // makes harmonics early; stage 2 (Character) is soft, biased and sags when pushed.
+        // Lows are emphasised into the stages and restored after (iron "weight").
+        { "Glow", CurveId::Tanh, 1.00f, 0.0f, 0.30f, 0.0f,
+          { { T::HP1, 20.0f, 0.7071f, 0.0f }, { T::LowShelf, 110.0f, 0.5f, 3.0f } },
+          { { T::LowShelf, 110.0f, 0.5f, -3.0f }, { T::Bell, 90.0f, 0.7f, 0.7f }, {} },
+          true, CurveId::Soft, 15.0f, 0.30f },
     };
     return specs[clampValue ((int) id, 0, kNumStyles - 1)];
 }

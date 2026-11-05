@@ -67,6 +67,10 @@ private:
     std::atomic<float>* pQuality = nullptr;
     std::atomic<float>* pLinearPhase = nullptr;
     std::atomic<float>* pStereoMode = nullptr;
+    std::atomic<float>* pParallel = nullptr;
+    std::atomic<float>* pParFocus = nullptr;
+    std::atomic<float>* pParAlt = nullptr;
+    std::atomic<float>* pAir = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PillowSaturatorAudioProcessor)
 };
